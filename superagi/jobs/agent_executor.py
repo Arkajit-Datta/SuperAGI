@@ -127,7 +127,7 @@ class AgentExecutor:
 
     @classmethod
     def get_llm_source(cls, agent_execution, session):
-        return Configuration.fetch_value_by_agent_id(session, agent_execution.agent_id, "model_source")
+        return Configuration.fetch_value_by_agent_id(session, agent_execution.agent_id, "model_source") or "OpenAi"
 
     @classmethod
     def get_embedding(cls, model_source, model_api_key):
@@ -191,11 +191,13 @@ class AgentExecutor:
         parsed_execution_config = AgentExecutionConfiguration.fetch_configuration(session, agent_execution)
         max_iterations = (parsed_config["max_iterations"])
         total_calls = agent_execution.num_of_calls
+        organisation = AgentExecutor.get_organisation(agent_execution, session)
 
         if max_iterations <= total_calls:
             db_agent_execution = session.query(AgentExecution).filter(AgentExecution.id == agent_execution_id).first()
             db_agent_execution.status = "ITERATION_LIMIT_EXCEEDED"
             session.commit()
+            EventHandler(session=session).create_event('run_iteration_limit_crossed', {'agent_execution_id':db_agent_execution.id,'name': db_agent_execution.name,'tokens_consumed':db_agent_execution.num_of_tokens,"calls":db_agent_execution.num_of_calls}, db_agent_execution.agent_id, organisation.id)
             logger.info("ITERATION_LIMIT_CROSSED")
             return "ITERATION_LIMIT_CROSSED"
 
@@ -245,10 +247,20 @@ class AgentExecutor:
         agent_workflow_step = session.query(AgentWorkflowStep).filter(
             AgentWorkflowStep.id == agent_execution.current_step_id).first()
 
-        response = spawned_agent.execute(agent_workflow_step)
+        try:
+            response = spawned_agent.execute(agent_workflow_step)
+        except RuntimeError as e:
+            # If our execution encounters an error we return and attempt to retry
+            logger.error("Error executing the agent:", e)
+            superagi.worker.execute_agent.apply_async((agent_execution_id, datetime.now()), countdown=15)
+            session.close()
+            return
 
         if "retry" in response and response["retry"]:
-            response = spawned_agent.execute(agent_workflow_step)
+            superagi.worker.execute_agent.apply_async((agent_execution_id, datetime.now()), countdown=10)
+            session.close()
+            return
+
         agent_execution.current_step_id = agent_workflow_step.next_step_id
         session.commit()
         if response["result"] == "COMPLETE":
